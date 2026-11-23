@@ -1,0 +1,54 @@
+name: mirror-releases
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - name: Mirror upstream releases into this fork
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          UP="pxx917144686/APP"
+          FORK="${{ github.repository }}"
+          gh release list -R "$UP" -L 200 --json tagName,createdAt \
+            -q 'sort_by(.createdAt)[] | .tagName' > /tmp/tags.txt
+          echo "releases: $(wc -l < /tmp/tags.txt)"
+          while read -r tag; do
+            [ -z "$tag" ] && continue
+            echo "=== $tag ==="
+            rel=$(gh api "repos/$UP/releases/tags/$tag") || { echo "  upstream fetch failed"; continue; }
+            pre=$(jq -r '.prerelease' <<<"$rel")
+            draft=$(jq -r '.draft' <<<"$rel")
+            jq -r '.name // .tag_name' <<<"$rel" > /tmp/name.txt
+            jq -r '.body // ""' <<<"$rel" > /tmp/body.md
+            if forkrel=$(gh api "repos/$FORK/releases/tags/$tag" 2>/dev/null); then
+              echo "  release exists"
+            else
+              forkrel=$(gh api -X POST "repos/$FORK/releases" \
+                -f tag_name="$tag" \
+                -f name="$(cat /tmp/name.txt)" \
+                -F prerelease="$pre" -F draft="$draft" \
+                -f body="$(cat /tmp/body.md)" 2>&1) || { echo "  create failed: $forkrel"; continue; }
+              echo "  created $(jq -r '.id' <<<"$forkrel")"
+            fi
+            while IFS=$'\t' read -r aname asize aurl; do
+              [ -z "$aname" ] && continue
+              have=$(jq --arg n "$aname" -r '[.assets[]|select(.name==$n)|.size]|first // empty' <<<"$forkrel")
+              if [ "$have" = "$asize" ]; then echo "  $aname ok"; continue; fi
+              gh api -H "Accept: application/octet-stream" "$aurl" > "/tmp/$aname" || { echo "  download failed $aname"; continue; }
+              got=$(stat -c%s "/tmp/$aname")
+              if [ "$got" != "$asize" ]; then echo "  SIZE MISMATCH $aname $got != $asize"; rm -f "/tmp/$aname"; continue; fi
+              gh release upload "$tag" "/tmp/$aname" -R "$FORK" --clobber >/dev/null && echo "  uploaded $aname" || echo "  upload failed $aname"
+              rm -f "/tmp/$aname"
+            done < <(jq -r '.assets[] | [.name, (.size|tostring), .url] | @tsv' <<<"$rel")
+          done < /tmp/tags.txt
+          echo ALLDONE
